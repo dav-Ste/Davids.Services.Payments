@@ -13,7 +13,7 @@ using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
 await builder.Configuration.LoadVaultAsync();
-builder.AddServiceDefaults();
+builder.AddServiceDefaults("davids-payments");
 builder.Services.AddTrustedForwardedHeaders(builder.Configuration, builder.Environment);
 builder.Services.AddPaymentsInfrastructure(builder.Configuration);
 
