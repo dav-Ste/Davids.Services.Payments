@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../Davids.Services.Payments.Core/Davids.Services.Payments.Core.csproj" />
+  </ItemGroup>
+</Project>

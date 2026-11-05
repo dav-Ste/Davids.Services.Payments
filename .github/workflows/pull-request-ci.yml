@@ -1,0 +1,193 @@
+name: Pull Request CI — Security Gate
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  secrets-semgrep-and-iac:
+    name: Gitleaks + Custom Davids Semgrep + Checkov
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout Davids.Services.Payments
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Run SHA-256 verified Gitleaks v8.30.1
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          chmod +x /tmp/gitleaks
+          /tmp/gitleaks dir . --config .gitleaks.toml --verbose --redact --no-banner
+          /tmp/gitleaks git . --config .gitleaks.toml --verbose --redact --no-banner
+
+      - name: Run Semgrep custom Davids security rules
+        run: |
+          python3 -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet semgrep==1.182.0
+          export PATH="$RUNNER_TEMP/semgrep-venv/bin:$PATH"
+          semgrep scan --validate --config .semgrep/davids-security.yml --metrics=off
+          semgrep scan --no-git-ignore --exclude=artifacts --exclude=bin --exclude=obj --exclude=.git --exclude=.vs --exclude=TestResults --config .semgrep/davids-security.yml . --error --metrics=off --sarif -o semgrep.sarif
+
+      - name: Upload Semgrep SARIF
+        if: always() && hashFiles('semgrep.sarif') != ''
+        continue-on-error: ${{ github.event.repository.private == true && vars.GHAS_ENABLED != 'true' }}
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-davids
+
+      - name: Run Checkov (dockerfile,github_actions)
+        uses: bridgecrewio/checkov-action@c10e2438743528f9e4549758fad8b7a62052541d # v12.3136.0
+        with:
+          directory: .
+          framework: dockerfile,github_actions
+          quiet: true
+          compact: true
+          skip_path: artifacts,bin,obj,TestResults
+
+  dotnet-sca-grype-and-trivy:
+    name: .NET 10 Build, NuGet JSON Audit & SHA-Pinned Grype/Trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout Davids.Services.Payments
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: Davids.Services.Payments
+
+      - name: Checkout Davids.Shared
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/Davids.Shared
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: Davids.Shared
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Locked restore, -warnaserror build, test & JSON vulnerability audit
+        shell: pwsh
+        working-directory: ./Davids.Services.Payments
+        run: |
+          dotnet restore Davids.Services.Payments.slnx --locked-mode -m:1 -nr:false --tl:off
+          if ($LASTEXITCODE) { throw 'Locked restore failed' }
+          dotnet build Davids.Services.Payments.slnx --no-restore -c Release -warnaserror -m:2 -nr:false --tl:off
+          if ($LASTEXITCODE) { throw 'Build failed' }
+          dotnet test Davids.Services.Payments.slnx --no-build -c Release -m:2 -nr:false --tl:off
+          if ($LASTEXITCODE) { throw 'Tests failed' }
+          $vulnRaw = (dotnet list Davids.Services.Payments.slnx package --vulnerable --include-transitive --format json) -join [Environment]::NewLine
+          if ($LASTEXITCODE) { throw 'NuGet vulnerability audit command failed' }
+          $report = $vulnRaw | ConvertFrom-Json
+          foreach ($proj in @($report.projects)) {
+            if ($null -eq $proj.PSObject.Properties['frameworks']) { continue }
+            foreach ($fw in @($proj.frameworks)) {
+              foreach ($grp in @('topLevelPackages', 'transitivePackages')) {
+                if ($null -eq $fw.PSObject.Properties[$grp]) { continue }
+                foreach ($pkg in @($fw.$grp)) {
+                  if ($null -ne $pkg.PSObject.Properties['vulnerabilities'] -and @($pkg.vulnerabilities).Count -gt 0) {
+                    throw "Vulnerable package detected in $($proj.path): $($pkg.id) $($pkg.resolvedVersion)"
+                  }
+                }
+              }
+            }
+          }
+
+      - name: Generate CycloneDX SBOM (Syft)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: ./Davids.Services.Payments
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+
+      - name: Scan SBOM with SHA-pinned Grype
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: sbom.cdx.json
+          fail-build: true
+          severity-cutoff: high
+          output-format: sarif
+
+      - name: Install SHA-256 verified Trivy v0.76.1
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          curl -fsSL https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_Linux-64bit.tar.gz -o "$RUNNER_TEMP/trivy.tar.gz"
+          echo "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0  $RUNNER_TEMP/trivy.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin"
+          chmod +x "$RUNNER_TEMP/trivy-bin/trivy"
+          rm -f "$RUNNER_TEMP/trivy.tar.gz"
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
+      # Exclude centralized MSBuild artifacts/ so Trivy scans source lockfiles & IaC only
+      - name: Scan lockfiles with SHA-pinned Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-setup-trivy: "true"
+          scan-type: fs
+          scan-ref: ./Davids.Services.Payments
+          skip-dirs: "**/artifacts,**/bin,**/obj,**/TestResults"
+          skip-files: "**/Dockerfile.dockerignore"
+          scanners: vuln,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+          exit-code: "1"
+          format: sarif
+          output: trivy-fs.sarif
+
+      - name: Upload Trivy filesystem SARIF
+        if: always() && hashFiles('trivy-fs.sarif') != ''
+        continue-on-error: ${{ github.event.repository.private == true && vars.GHAS_ENABLED != 'true' }}
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Build hardened container image
+        run: |
+          docker build -f ./Davids.Services.Payments/Dockerfile -t davids-ci/davids-services-payments:pr .
+
+      - name: Scan container image with SHA-pinned Grype
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: "davids-ci/davids-services-payments:pr"
+          fail-build: true
+          severity-cutoff: high
+
+      - name: Scan container image with SHA-pinned Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-setup-trivy: "true"
+          image-ref: "davids-ci/davids-services-payments:pr"
+          scanners: vuln,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+          exit-code: "1"
+          format: sarif
+          output: trivy-image.sarif
+
+      - name: Upload Trivy image SARIF
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        continue-on-error: ${{ github.event.repository.private == true && vars.GHAS_ENABLED != 'true' }}
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-davids-services-payments
