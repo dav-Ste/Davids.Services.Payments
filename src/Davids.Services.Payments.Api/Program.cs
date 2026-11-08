@@ -2,6 +2,7 @@ using System.Security.Claims;
 using Davids.ServiceDefaults;
 using Davids.Services.Payments.Api;
 using Davids.Services.Payments.Api.Exceptions;
+using Davids.Services.Payments.Application.DTO;
 using Davids.Services.Payments.Application.Services;
 using Davids.Services.Payments.Infrastructure;
 using Davids.Services.Payments.Infrastructure.Auth;
@@ -176,6 +177,11 @@ app.MapGet("/", () => Results.Text("Davids Payments Service"))
 
 app.MapGet("/payments/me", async (int? limit, ClaimsPrincipal user, IPaymentsService service, CancellationToken ct) =>
     {
+        if (limit is <= 0 or > 200)
+        {
+            return Results.BadRequest(new { code = "invalid_query", reason = "Limit must be between 1 and 200." });
+        }
+
         if (!TryGetCustomerId(user, out var customerId))
         {
             return Results.Unauthorized();
@@ -183,6 +189,8 @@ app.MapGet("/payments/me", async (int? limit, ClaimsPrincipal user, IPaymentsSer
 
         return Results.Ok(await service.GetCustomerPaymentsAsync(customerId, limit ?? 50, ct));
     })
+    .Produces<IReadOnlyList<PaymentDto>>(StatusCodes.Status200OK)
+    .Produces(StatusCodes.Status400BadRequest)
     .RequireAuthorization("CustomerOnly");
 
 app.MapGet("/payments/me/order/{orderId:guid}", async (Guid orderId, ClaimsPrincipal user, IPaymentsService service, CancellationToken ct) =>
@@ -195,12 +203,23 @@ app.MapGet("/payments/me/order/{orderId:guid}", async (Guid orderId, ClaimsPrinc
         var payment = await service.GetCustomerPaymentByOrderAsync(customerId, orderId, ct);
         return payment is null ? Results.NotFound() : Results.Ok(payment);
     })
+    .Produces<PaymentDto>(StatusCodes.Status200OK)
+    .Produces(StatusCodes.Status400BadRequest)
+    .Produces(StatusCodes.Status404NotFound)
     .RequireAuthorization("CustomerOnly");
 
 app.MapGet("/payments", async (string? status, Guid? customerId, int? limit, IPaymentsService service, CancellationToken ct) =>
     {
+        if ((status is not null && (status.Length > 40 || status.Contains('\0'))) ||
+            limit is <= 0 or > 500)
+        {
+            return Results.BadRequest(new { code = "invalid_query", reason = "Query parameters must be within bounds without control bytes." });
+        }
+
         return Results.Ok(await service.SearchWorkforceAsync(status, customerId, limit ?? 100, ct));
     })
+    .Produces<IReadOnlyList<PaymentDto>>(StatusCodes.Status200OK)
+    .Produces(StatusCodes.Status400BadRequest)
     .RequireAuthorization("WorkforceRead");
 
 app.MapGet("/payments/order/{orderId:guid}", async (Guid orderId, IPaymentsService service, CancellationToken ct) =>
@@ -208,6 +227,9 @@ app.MapGet("/payments/order/{orderId:guid}", async (Guid orderId, IPaymentsServi
         var payment = await service.GetWorkforcePaymentByOrderAsync(orderId, ct);
         return payment is null ? Results.NotFound() : Results.Ok(payment);
     })
+    .Produces<PaymentDto>(StatusCodes.Status200OK)
+    .Produces(StatusCodes.Status400BadRequest)
+    .Produces(StatusCodes.Status404NotFound)
     .RequireAuthorization("WorkforceRead");
 
 app.Run();

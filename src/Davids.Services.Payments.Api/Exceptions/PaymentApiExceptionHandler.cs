@@ -7,18 +7,36 @@ public sealed class PaymentApiExceptionHandler(ILogger<PaymentApiExceptionHandle
 {
     public async ValueTask<bool> TryHandleAsync(HttpContext httpContext, Exception exception, CancellationToken cancellationToken)
     {
-        if (exception is not DomainException domain)
+        if (exception is OperationCanceledException && httpContext.RequestAborted.IsCancellationRequested)
         {
-            return false;
+            if (!httpContext.Response.HasStarted)
+            {
+                httpContext.Response.StatusCode = StatusCodes.Status499ClientClosedRequest;
+            }
+
+            return true;
         }
 
-        logger.LogWarning("Payments domain error {Code}: {Message}", domain.Code, domain.Message);
-        httpContext.Response.StatusCode = StatusCodes.Status400BadRequest;
-        await httpContext.Response.WriteAsJsonAsync(new
+        var (status, code, reason) = exception switch
         {
-            code = domain.Code,
-            reason = domain.Message
-        }, cancellationToken);
+            DomainException domain => (StatusCodes.Status400BadRequest, domain.Code, domain.Message),
+            ArgumentException => (StatusCodes.Status400BadRequest, "invalid_request", "Invalid request."),
+            InvalidDataException => (StatusCodes.Status400BadRequest, "invalid_request", "Malformed request payload."),
+            BadHttpRequestException => (StatusCodes.Status400BadRequest, "invalid_request", "Invalid request body or parameters."),
+            _ => (StatusCodes.Status500InternalServerError, "error", "There was an error processing the request.")
+        };
+
+        if (status == StatusCodes.Status500InternalServerError)
+        {
+            logger.LogError(exception, "Payments API request failed.");
+        }
+        else if (exception is DomainException)
+        {
+            logger.LogWarning("Payments domain error {Code}: {Message}", code, reason);
+        }
+
+        httpContext.Response.StatusCode = status;
+        await httpContext.Response.WriteAsJsonAsync(new { code, reason }, cancellationToken);
         return true;
     }
 }

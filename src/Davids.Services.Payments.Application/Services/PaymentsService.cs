@@ -127,5 +127,5 @@ public sealed class PaymentsService(IPaymentRepository repository, IOutboxWriter
         tx.Status == PaymentStatus.Captured ? "captured" : "declined",
         tx.ProviderReference,
         tx.FailureReason,
-        tx.CreatedAt);
+        DateTime.SpecifyKind(tx.CreatedAt, DateTimeKind.Utc));
 }
